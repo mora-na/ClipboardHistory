@@ -33,6 +33,7 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
     private var previewReturnApp: NSRunningApplication?
     private var previewItem: HistoryPreviewItem?
     private var previewAutoCloseToken = UUID()
+    private var needsContentViewInstall = true
 
     private let monitor = ClipboardMonitor.shared
     private let store = ClipboardStore.shared
@@ -63,6 +64,7 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
         p.alphaValue = 0
         p.orderOut(nil)
         p.setFrame(targetFrame, display: false)
+        installContentViewIfNeeded(on: p)
         p.contentView?.layoutSubtreeIfNeeded()
 
         setupKeyMonitor()
@@ -79,13 +81,6 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
     }
 
     private func createPanel() -> NSPanel {
-        let historyView = HistoryView { [weak self] item in
-            self?.confirmSelection(item)
-        }
-
-        let hostingView = NSHostingView(rootView: historyView)
-        hostingView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-
         let p = HistoryPanel(
             contentRect: offscreenFrame(),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -93,7 +88,6 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
             defer: false
         )
 
-        p.contentView = hostingView
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
@@ -108,6 +102,19 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
         return p
     }
 
+    private func installContentViewIfNeeded(on panel: NSPanel) {
+        guard needsContentViewInstall || panel.contentView == nil else { return }
+
+        let historyView = HistoryView { [weak self] item in
+            self?.confirmSelection(item)
+        }
+
+        let hostingView = NSHostingView(rootView: historyView)
+        hostingView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
+        panel.contentView = hostingView
+        needsContentViewInstall = false
+    }
+
     func hide() {
         closePreview(restoreFocus: false)
         keyEventMonitor.map { NSEvent.removeMonitor($0) }
@@ -117,6 +124,9 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
             currentPanel.alphaValue = 0
             currentPanel.orderOut(nil)
             currentPanel.setFrame(offscreenFrame(), display: false)
+            currentPanel.makeFirstResponder(nil)
+            currentPanel.contentView = nil
+            needsContentViewInstall = true
         }
 
         store.releaseTransientMemoryAfterClose()
@@ -184,11 +194,17 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
 
             if flags.contains([.command, .option]), event.keyCode == 51 || event.keyCode == 117 {
                 self.store.clearAll()
+                self.hide()
+                return nil
+            }
+
+            if flags.contains(.option), event.keyCode == 51 || event.keyCode == 117 {
+                self.store.deleteSelectedVisibleItem()
                 return nil
             }
 
             if flags.contains(.command), event.keyCode == 51 || event.keyCode == 117 {
-                self.store.deleteSelectedVisibleItem()
+                self.store.clearSearch()
                 return nil
             }
 
@@ -293,7 +309,12 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
         previewAutoCloseToken = UUID()
 
         if let panel = QLPreviewPanel.shared(), panel.isVisible {
-            panel.orderOut(nil)
+            panel.close()
+            panel.dataSource = nil
+            panel.delegate = nil
+        } else if let panel = QLPreviewPanel.shared() {
+            panel.dataSource = nil
+            panel.delegate = nil
         }
 
         previewItem = nil
@@ -388,6 +409,8 @@ class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSou
 
     func previewPanelWillClose(_ panel: QLPreviewPanel!) {
         previewAutoCloseToken = UUID()
+        panel.dataSource = nil
+        panel.delegate = nil
         previewItem = nil
         if isPreviewing {
             isPreviewing = false

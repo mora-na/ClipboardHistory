@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import CryptoKit
+import Darwin
 
 /// 剪切板历史记录存储管理器
 /// 负责管理最多 100 条历史记录，文本保存在内存中，大对象缓存到磁盘
@@ -279,6 +280,12 @@ class ClipboardStore: ObservableObject {
         isKeyboardNavigating = true
         scrollRequestUsesTopAnchor = false
         searchHasMarkedText = false
+        ImageThumbnailProvider.shared.removeAll()
+        releaseAllocatorPressure()
+    }
+
+    func releaseAllocatorPressure() {
+        malloc_zone_pressure_relief(nil, 0)
     }
 
     private var searchCriteria: (type: ClipboardItemType?, keyword: String?) {
@@ -411,6 +418,25 @@ class ClipboardStore: ObservableObject {
 
         do {
             try tiffData.write(to: fileURL, options: .atomic)
+            return fileURL
+        } catch {
+            print("ClipboardHistory: 图片缓存写入失败: \(error)")
+            return nil
+        }
+    }
+
+    /// 直接缓存剪贴板里的图片编码数据，避免创建全尺寸 NSImage 和 tiffRepresentation
+    func cacheImageData(_ data: Data, fileExtension: String) -> URL? {
+        let hash = SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+        let filename = "img_\(hash).\(fileExtension)"
+        let fileURL = cacheDir.appendingPathComponent(filename)
+
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            return fileURL
+        }
+
+        do {
+            try data.write(to: fileURL, options: .atomic)
             return fileURL
         } catch {
             print("ClipboardHistory: 图片缓存写入失败: \(error)")

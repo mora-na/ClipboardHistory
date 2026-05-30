@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import ImageIO
 
 /// 剪切板监听器
 /// 通过轮询 NSPasteboard.general.changeCount 检测剪切板变化
@@ -62,6 +63,7 @@ class ClipboardMonitor {
         // 读取粘贴板内容
         guard let item = readPasteboard() else { return }
         store.addItem(item)
+        store.releaseAllocatorPressure()
     }
 
     /// 读取当前粘贴板内容并创建历史记录条目
@@ -117,21 +119,42 @@ class ClipboardMonitor {
 
     /// 读取图片类型
     private func readImageItem(types: [NSPasteboard.PasteboardType]) -> ClipboardHistoryItem? {
-        guard let image = NSImage(pasteboard: pasteboard) else { return nil }
+        return autoreleasepool {
+            let imageData: Data
+            let fileExtension: String
 
-        // 写入磁盘缓存
-        guard let cacheURL = store.cacheImage(image) else { return nil }
+            if let pngData = pasteboard.data(forType: .png), !pngData.isEmpty {
+                imageData = pngData
+                fileExtension = "png"
+            } else if let tiffData = pasteboard.data(forType: .tiff), !tiffData.isEmpty {
+                imageData = tiffData
+                fileExtension = "tiff"
+            } else {
+                return nil
+            }
 
-        // 获取图片尺寸作为标题
-        let size = image.size
-        let title = "图片 (\(Int(size.width))×\(Int(size.height)))"
+            guard let cacheURL = store.cacheImageData(imageData, fileExtension: fileExtension) else { return nil }
+            let size = imageSize(from: imageData)
+            let title = "图片 (\(Int(size.width))×\(Int(size.height)))"
 
-        return ClipboardHistoryItem(
-            type: .image,
-            title: title,
-            cacheFileURL: cacheURL,
-            pasteboardTypes: types.map { $0.rawValue }
-        )
+            return ClipboardHistoryItem(
+                type: .image,
+                title: title,
+                cacheFileURL: cacheURL,
+                pasteboardTypes: types.map { $0.rawValue }
+            )
+        }
+    }
+
+    private func imageSize(from data: Data) -> NSSize {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            return .zero
+        }
+
+        let width = properties[kCGImagePropertyPixelWidth] as? CGFloat ?? 0
+        let height = properties[kCGImagePropertyPixelHeight] as? CGFloat ?? 0
+        return NSSize(width: width, height: height)
     }
 
     /// 读取文件类型

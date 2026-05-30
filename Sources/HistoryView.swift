@@ -321,10 +321,10 @@ struct HistoryRowView: View {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFill()
-                .frame(width: 36, height: 36)
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .frame(width: 24, height: 24)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 5)
+                    RoundedRectangle(cornerRadius: 4)
                         .stroke(Color(NSColor.separatorColor), lineWidth: 0.5)
                 )
         } else {
@@ -390,8 +390,8 @@ final class ImageThumbnailProvider {
     private let cache = NSCache<NSURL, NSImage>()
 
     private init() {
-        cache.countLimit = 30
-        cache.totalCostLimit = 2 * 1024 * 1024
+        cache.countLimit = 12
+        cache.totalCostLimit = 256 * 1024
     }
 
     func thumbnail(for url: URL) -> NSImage? {
@@ -409,14 +409,14 @@ final class ImageThumbnailProvider {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCache: false,
             kCGImageSourceShouldCacheImmediately: false,
-            kCGImageSourceThumbnailMaxPixelSize: 72
+            kCGImageSourceThumbnailMaxPixelSize: 24
         ]
 
         guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
             return nil
         }
 
-        let image = NSImage(cgImage: cgImage, size: NSSize(width: 36, height: 36))
+        let image = NSImage(cgImage: cgImage, size: NSSize(width: 24, height: 24))
         cache.setObject(image, forKey: key, cost: cgImage.bytesPerRow * cgImage.height)
         return image
     }
