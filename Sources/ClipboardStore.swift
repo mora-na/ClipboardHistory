@@ -16,6 +16,21 @@ class ClipboardStore: ObservableObject {
     /// 当前选中条目的 ID（用于键盘导航和视觉高亮）
     @Published var selectedItemID: UUID?
 
+    /// 键盘导航时需要滚动露出的条目 ID
+    @Published var keyboardScrollItemID: UUID?
+
+    /// 滚动请求令牌；即使目标相同也能触发 ScrollViewReader 执行
+    @Published var scrollRequestID = UUID()
+
+    /// 当前滚动请求是否需要把目标放到顶部
+    var scrollRequestUsesTopAnchor = false
+
+    /// 是否正在用键盘导航；为 true 时 hover 只缓存，不直接覆盖选中项
+    @Published var isKeyboardNavigating = true
+
+    /// 键盘导航期间鼠标所在条目，等鼠标真正移动后再应用
+    var hoverSelectionWhileKeyboardNavigating: UUID?
+
     /// 磁盘缓存目录
     private let cacheDir: URL
 
@@ -92,6 +107,70 @@ class ClipboardStore: ObservableObject {
             self.items.insert(moved, at: 0)
             self.saveMetadata()
         }
+    }
+
+    // MARK: - 清空记录
+
+    /// 清空所有历史记录和对应的磁盘缓存
+    func clearAll() {
+        for item in items {
+            cleanupCacheForItem(item)
+        }
+
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: cacheDir, includingPropertiesForKeys: nil
+        ) {
+            for file in files {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+
+        items.removeAll()
+        selectedItemID = nil
+        keyboardScrollItemID = nil
+        scrollRequestID = UUID()
+        isKeyboardNavigating = true
+        hoverSelectionWhileKeyboardNavigating = nil
+        imageHashes.removeAll()
+        saveMetadata()
+    }
+
+    // MARK: - 导航状态
+
+    func selectFromHover(_ id: UUID) {
+        if isKeyboardNavigating {
+            hoverSelectionWhileKeyboardNavigating = id
+        } else {
+            selectedItemID = id
+        }
+    }
+
+    func noteMouseMoved() {
+        guard isKeyboardNavigating else { return }
+        isKeyboardNavigating = false
+
+        if let hoverID = hoverSelectionWhileKeyboardNavigating {
+            hoverSelectionWhileKeyboardNavigating = nil
+            selectedItemID = hoverID
+        }
+    }
+
+    func selectFromKeyboard(_ id: UUID?) {
+        isKeyboardNavigating = true
+        hoverSelectionWhileKeyboardNavigating = nil
+        selectedItemID = id
+        keyboardScrollItemID = id
+        scrollRequestUsesTopAnchor = false
+        scrollRequestID = UUID()
+    }
+
+    func resetNavigationToTop() {
+        isKeyboardNavigating = true
+        hoverSelectionWhileKeyboardNavigating = nil
+        selectedItemID = items.first?.id
+        keyboardScrollItemID = items.first?.id
+        scrollRequestUsesTopAnchor = true
+        scrollRequestID = UUID()
     }
 
     // MARK: - 恢复记录到剪切板

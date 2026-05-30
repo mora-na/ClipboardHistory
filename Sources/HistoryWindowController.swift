@@ -1,6 +1,11 @@
 import SwiftUI
 import AppKit
 
+private final class HistoryPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 /// 历史记录弹出窗口控制器
 /// 无标题栏浮动面板，弹出时短暂激活以接收键盘事件
 /// 失去焦点自动关闭，选中后还原上一个应用的焦点再粘贴
@@ -17,6 +22,8 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
 
     private let windowWidth: CGFloat = 380
     private let windowHeight: CGFloat = 460
+    private let mouseHorizontalOffset: CGFloat = 16
+    private let mouseVerticalOffset: CGFloat = 6
 
     private override init() {
         super.init()
@@ -28,12 +35,29 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         // 记住当前前台应用，以便稍后还原焦点
         previousApp = NSWorkspace.shared.frontmostApplication
 
-        // 若已有窗口则先销毁，保证不会出现多窗口叠加
-        if panel != nil {
+        if panel?.isVisible == true {
             hide()
         }
 
-        // 每次创建全新 panel
+        let p = panel ?? createPanel()
+        panel = p
+        let targetFrame = frameAtMouse()
+
+        p.alphaValue = 0
+        p.orderOut(nil)
+        p.setFrame(targetFrame, display: false)
+        p.contentView?.layoutSubtreeIfNeeded()
+
+        setupKeyMonitor()
+        resetSelection()
+
+        p.orderFrontRegardless()
+        p.makeKey()
+
+        p.alphaValue = 1
+    }
+
+    private func createPanel() -> NSPanel {
         let historyView = HistoryView { [weak self] item in
             self?.confirmSelection(item)
         }
@@ -41,9 +65,9 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         let hostingView = NSHostingView(rootView: historyView)
         hostingView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
-        let p = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight),
-            styleMask: [.borderless],
+        let p = HistoryPanel(
+            contentRect: offscreenFrame(),
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -52,68 +76,65 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
-        p.level = .floating
+        p.level = .statusBar
         p.isFloatingPanel = true
-        p.collectionBehavior = [.canJoinAllSpaces, .transient]
+        p.collectionBehavior = [.auxiliary, .stationary, .moveToActiveSpace, .fullScreenAuxiliary]
         p.isReleasedWhenClosed = false
         p.animationBehavior = .none
+        p.hidesOnDeactivate = false
         p.delegate = self
-
-        // 先全透明隐藏，定位后再显示，杜绝任何位置闪现
         p.alphaValue = 0
-        positionAtMouse(p)
-        setupKeyMonitor()
-        panel = p
-        resetSelection()
-
-        p.makeKeyAndOrderFront(nil)
-        NSApplication.shared.activate(ignoringOtherApps: true)
-
-        // 下一帧恢复不透明度，确保窗口直接在正确位置出现
-        DispatchQueue.main.async {
-            p.alphaValue = 1
-        }
+        return p
     }
 
     func hide() {
         keyEventMonitor.map { NSEvent.removeMonitor($0) }
         keyEventMonitor = nil
-        panel?.orderOut(nil)
-        panel = nil // 彻底释放，回收 SwiftUI 视图树内存
+
+        if let currentPanel = panel {
+            currentPanel.alphaValue = 0
+            currentPanel.orderOut(nil)
+            currentPanel.setFrame(offscreenFrame(), display: false)
+        }
+
         isConfirming = false
     }
 
     // MARK: - 定位：鼠标为窗口左上角
 
-    private func positionAtMouse(_ window: NSWindow) {
+    private func offscreenFrame() -> NSRect {
+        NSRect(x: -10000, y: -10000, width: windowWidth, height: windowHeight)
+    }
+
+    private func frameAtMouse() -> NSRect {
         let mouseLoc = NSEvent.mouseLocation
 
         guard let screen = NSScreen.screens.first(where: {
             NSMouseInRect(mouseLoc, $0.frame, false)
         }) else {
-            window.center()
-            return
+            let fallbackFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
+            let x = fallbackFrame.midX - windowWidth / 2
+            let y = fallbackFrame.midY - windowHeight / 2
+            return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
         }
 
         let screenFrame = screen.visibleFrame
 
-        // 左上角对齐鼠标，窗口向下延伸
-        var x = mouseLoc.x
-        var y = mouseLoc.y - windowHeight
+        // 从鼠标右下方弹出，避免唤醒后鼠标直接落在列表行上触发 hover 选中
+        var x = mouseLoc.x + mouseHorizontalOffset
+        var y = mouseLoc.y - windowHeight - mouseVerticalOffset
 
         // 水平约束
         if x + windowWidth > screenFrame.maxX { x = screenFrame.maxX - windowWidth - 8 }
         if x < screenFrame.minX { x = screenFrame.minX + 8 }
 
-        // 垂直约束：下方空间不够则改为窗口在鼠标上方
-        if y < screenFrame.minY { y = screenFrame.minY + 8 }
+        // 垂直约束：只在屏幕边缘做最小修正，避免显示后再跳位置
+        if y + windowHeight > screenFrame.maxY { y = screenFrame.maxY - windowHeight - 8 }
         if y < screenFrame.minY {
-            // 鼠标下方空间不足，弹在鼠标上方
-            y = mouseLoc.y + 12
-            if y + windowHeight > screenFrame.maxY { y = screenFrame.maxY - windowHeight - 8 }
+            y = screenFrame.minY + 8
         }
 
-        window.setFrameOrigin(NSPoint(x: x, y: y))
+        return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
     }
 
     // MARK: - 键盘事件
@@ -121,6 +142,17 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     private func setupKeyMonitor() {
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
+
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags.contains(.command), event.keyCode == 12 {
+                NSApplication.shared.terminate(nil)
+                return nil
+            }
+
+            if flags.contains([.command, .option]), event.keyCode == 51 || event.keyCode == 117 {
+                self.store.clearAll()
+                return nil
+            }
 
             switch Int(event.keyCode) {
             case 126, 123: // ↑ / ← → 上移
@@ -153,12 +185,13 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         guard !items.isEmpty else { return }
 
         guard let current = store.selectedItemID,
-              let idx = items.firstIndex(where: { $0.id == current }),
-              idx > 0 else {
-            store.selectedItemID = items.first?.id
+              let idx = items.firstIndex(where: { $0.id == current }) else {
+            store.selectFromKeyboard(items.last?.id)
             return
         }
-        store.selectedItemID = items[idx - 1].id
+
+        let nextIndex = idx > 0 ? idx - 1 : items.count - 1
+        store.selectFromKeyboard(items[nextIndex].id)
     }
 
     private func moveSelectionDown() {
@@ -166,16 +199,17 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         guard !items.isEmpty else { return }
 
         guard let current = store.selectedItemID,
-              let idx = items.firstIndex(where: { $0.id == current }),
-              idx < items.count - 1 else {
-            store.selectedItemID = items.last?.id
+              let idx = items.firstIndex(where: { $0.id == current }) else {
+            store.selectFromKeyboard(items.first?.id)
             return
         }
-        store.selectedItemID = items[idx + 1].id
+
+        let nextIndex = idx < items.count - 1 ? idx + 1 : 0
+        store.selectFromKeyboard(items[nextIndex].id)
     }
 
     private func resetSelection() {
-        store.selectedItemID = store.items.first?.id
+        store.resetNavigationToTop()
     }
 
     // MARK: - 确认选中

@@ -14,19 +14,6 @@ struct HistoryView: View {
             } else {
                 listView
             }
-
-            Divider()
-
-            // 底部退出按钮
-            Button(action: {
-                NSApplication.shared.terminate(nil)
-            }) {
-                Text("退出")
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-            }
-            .buttonStyle(.plain)
-            .background(Color(NSColor.controlBackgroundColor))
         }
         .frame(width: 380, height: 460)
         .background(
@@ -38,6 +25,9 @@ struct HistoryView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color(NSColor.separatorColor).opacity(0.5), lineWidth: 0.5)
         )
+        .onMouseMove {
+            store.noteMouseMoved()
+        }
     }
 
     // MARK: - 空状态
@@ -72,7 +62,7 @@ struct HistoryView: View {
                         .contentShape(Rectangle())
                         .onHover { hovering in
                             if hovering {
-                                store.selectedItemID = item.id
+                                store.selectFromHover(item.id)
                             }
                         }
                         .onTapGesture {
@@ -88,11 +78,77 @@ struct HistoryView: View {
                     }
                 }
             }
-            .onChange(of: store.selectedItemID) { newID in
-                guard let id = newID else { return }
-                proxy.scrollTo(id, anchor: .center)
+            .onChange(of: store.scrollRequestID) { _ in
+                guard let id = store.keyboardScrollItemID else { return }
+                withTransaction(Transaction(animation: .easeOut(duration: 0.12))) {
+                    if store.scrollRequestUsesTopAnchor {
+                        proxy.scrollTo(id, anchor: .top)
+                    } else {
+                        proxy.scrollTo(id)
+                    }
+                }
             }
         }
+    }
+}
+
+// MARK: - Mouse move tracking
+
+private struct MouseMovedViewModifier: ViewModifier {
+    let mouseMoved: () -> Void
+
+    func body(content: Content) -> some View {
+        content.background(MouseMovedRepresentable(mouseMoved: mouseMoved))
+    }
+}
+
+private struct MouseMovedRepresentable: NSViewRepresentable {
+    let mouseMoved: () -> Void
+
+    func makeNSView(context: Context) -> MouseMovedView {
+        let view = MouseMovedView()
+        view.mouseMoved = mouseMoved
+        return view
+    }
+
+    func updateNSView(_ nsView: MouseMovedView, context: Context) {
+        nsView.mouseMoved = mouseMoved
+        nsView.refreshTrackingArea()
+    }
+}
+
+private final class MouseMovedView: NSView {
+    var mouseMoved: (() -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        refreshTrackingArea()
+    }
+
+    func refreshTrackingArea() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [
+            .mouseMoved,
+            .activeAlways,
+            .inVisibleRect
+        ]
+        let area = NSTrackingArea(rect: bounds, options: options, owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        mouseMoved?()
+    }
+}
+
+private extension View {
+    func onMouseMove(_ mouseMoved: @escaping () -> Void) -> some View {
+        modifier(MouseMovedViewModifier(mouseMoved: mouseMoved))
     }
 }
 
