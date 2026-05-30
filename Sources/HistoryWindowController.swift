@@ -1,21 +1,38 @@
 import SwiftUI
 import AppKit
+import Quartz
 
 private final class HistoryPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
 
+private final class HistoryPreviewItem: NSObject, QLPreviewItem {
+    let previewItemURL: URL?
+    let previewItemTitle: String?
+
+    init(url: URL, title: String) {
+        previewItemURL = url
+        previewItemTitle = title
+        super.init()
+    }
+}
+
 /// 历史记录弹出窗口控制器
 /// 无标题栏浮动面板，弹出时短暂激活以接收键盘事件
 /// 失去焦点自动关闭，选中后还原上一个应用的焦点再粘贴
-class HistoryWindowController: NSObject, NSWindowDelegate {
+class HistoryWindowController: NSObject, NSWindowDelegate, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     static let shared = HistoryWindowController()
 
     private var panel: NSPanel?
     private var keyEventMonitor: Any?
     private var previousApp: NSRunningApplication?
     private var isConfirming = false
+    private var isPreviewing = false
+    private var isRestoringFocusAfterPreview = false
+    private var previewReturnApp: NSRunningApplication?
+    private var previewItem: HistoryPreviewItem?
+    private var previewAutoCloseToken = UUID()
 
     private let monitor = ClipboardMonitor.shared
     private let store = ClipboardStore.shared
@@ -55,6 +72,10 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
         p.makeKey()
 
         p.alphaValue = 1
+
+        DispatchQueue.main.async {
+            self.store.focusSearchField()
+        }
     }
 
     private func createPanel() -> NSPanel {
@@ -88,6 +109,7 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     func hide() {
+        closePreview(restoreFocus: false)
         keyEventMonitor.map { NSEvent.removeMonitor($0) }
         keyEventMonitor = nil
 
@@ -97,6 +119,8 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
             currentPanel.setFrame(offscreenFrame(), display: false)
         }
 
+        store.releaseTransientMemoryAfterClose()
+        cleanupPreviewTempFiles()
         isConfirming = false
     }
 
@@ -144,6 +168,15 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
             guard let self = self else { return event }
 
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if flags.contains(.command), event.keyCode == 13 {
+                if self.isPreviewing {
+                    self.closePreview(restoreFocus: true)
+                } else {
+                    self.hide()
+                }
+                return nil
+            }
+
             if flags.contains(.command), event.keyCode == 12 {
                 NSApplication.shared.terminate(nil)
                 return nil
@@ -154,7 +187,19 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
                 return nil
             }
 
+            if flags.contains(.command), event.keyCode == 51 || event.keyCode == 117 {
+                self.store.deleteSelectedVisibleItem()
+                return nil
+            }
+
             switch Int(event.keyCode) {
+            case 49: // Space → Quick Look 预览选中项
+                if searchFieldHasMarkedText() {
+                    return event
+                }
+                self.togglePreview()
+                return nil
+
             case 126, 123: // ↑ / ← → 上移
                 self.moveSelectionUp()
                 return nil
@@ -165,12 +210,16 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
 
             case 36: // 回车 → 确认选中
                 if let id = self.store.selectedItemID,
-                   let item = self.store.items.first(where: { $0.id == id }) {
+                   let item = self.store.visibleItems.first(where: { $0.id == id }) {
                     self.confirmSelection(item)
                 }
                 return nil
 
             case 53: // Esc → 关闭
+                if !self.store.searchQuery.isEmpty {
+                    self.store.clearSearch()
+                    return nil
+                }
                 self.hide()
                 return nil
 
@@ -181,7 +230,7 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     private func moveSelectionUp() {
-        let items = store.items
+        let items = store.visibleItems
         guard !items.isEmpty else { return }
 
         guard let current = store.selectedItemID,
@@ -195,7 +244,7 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     private func moveSelectionDown() {
-        let items = store.items
+        let items = store.visibleItems
         guard !items.isEmpty else { return }
 
         guard let current = store.selectedItemID,
@@ -209,7 +258,141 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     private func resetSelection() {
-        store.resetNavigationToTop()
+        store.prepareForPopupOpen()
+    }
+
+    // MARK: - Quick Look
+
+    private func togglePreview() {
+        if let panel = QLPreviewPanel.shared(), panel.isVisible {
+            closePreview(restoreFocus: true)
+            return
+        }
+
+        guard let id = store.selectedItemID,
+              let item = store.visibleItems.first(where: { $0.id == id }),
+              let previewURL = previewURL(for: item) else {
+            return
+        }
+
+        previewItem = HistoryPreviewItem(url: previewURL, title: item.title)
+        previewReturnApp = NSWorkspace.shared.frontmostApplication ?? previousApp
+        isPreviewing = true
+        isRestoringFocusAfterPreview = false
+
+        guard let panel = QLPreviewPanel.shared() else { return }
+        panel.dataSource = self
+        panel.delegate = self
+        panel.reloadData()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        schedulePreviewAutoClose()
+    }
+
+    private func closePreview(restoreFocus: Bool) {
+        previewAutoCloseToken = UUID()
+
+        if let panel = QLPreviewPanel.shared(), panel.isVisible {
+            panel.orderOut(nil)
+        }
+
+        previewItem = nil
+        let shouldRestoreFocus = restoreFocus && isPreviewing
+        isPreviewing = false
+
+        if shouldRestoreFocus {
+            restoreExternalFocusAfterPreview()
+        }
+    }
+
+    private func schedulePreviewAutoClose() {
+        let token = UUID()
+        previewAutoCloseToken = token
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+            guard let self,
+                  self.previewAutoCloseToken == token,
+                  self.isPreviewing,
+                  let panel = QLPreviewPanel.shared(),
+                  panel.isVisible else {
+                return
+            }
+
+            self.closePreview(restoreFocus: true)
+        }
+    }
+
+    private func restoreExternalFocusAfterPreview() {
+        isRestoringFocusAfterPreview = true
+        previewReturnApp?.activate(options: .activateIgnoringOtherApps)
+        previewReturnApp = nil
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            self.isRestoringFocusAfterPreview = false
+        }
+    }
+
+    private func previewURL(for item: ClipboardHistoryItem) -> URL? {
+        switch item.type {
+        case .text:
+            return textPreviewURL(for: item)
+        case .image:
+            return item.cacheFileURL
+        case .file:
+            return item.fileURLs?.first
+        case .other:
+            return item.cacheFileURL
+        }
+    }
+
+    private func textPreviewURL(for item: ClipboardHistoryItem) -> URL? {
+        let previewDir = previewTempDirectory()
+        try? FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
+
+        let fileURL = previewDir.appendingPathComponent("\(item.id.uuidString).txt")
+        let text: String
+
+        if let cacheURL = item.cacheFileURL,
+           let data = try? Data(contentsOf: cacheURL),
+           let fullText = String(data: data, encoding: .utf8) {
+            text = fullText
+        } else {
+            text = item.textPreview ?? item.title
+        }
+
+        do {
+            try text.write(to: fileURL, atomically: true, encoding: .utf8)
+            return fileURL
+        } catch {
+            print("ClipboardHistory: 写入预览文本失败: \(error)")
+            return nil
+        }
+    }
+
+    private func previewTempDirectory() -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClipboardHistoryPreview", isDirectory: true)
+    }
+
+    private func cleanupPreviewTempFiles() {
+        try? FileManager.default.removeItem(at: previewTempDirectory())
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        previewItem == nil ? 0 : 1
+    }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        previewItem
+    }
+
+    func previewPanelWillClose(_ panel: QLPreviewPanel!) {
+        previewAutoCloseToken = UUID()
+        previewItem = nil
+        if isPreviewing {
+            isPreviewing = false
+            restoreExternalFocusAfterPreview()
+        }
     }
 
     // MARK: - 确认选中
@@ -266,6 +449,10 @@ class HistoryWindowController: NSObject, NSWindowDelegate {
 
     /// 窗口失去焦点 → 用户点击了其他地方 → 关闭
     func windowDidResignKey(_ notification: Notification) {
+        if isPreviewing || isRestoringFocusAfterPreview {
+            return
+        }
+
         if !isConfirming {
             hide()
         }

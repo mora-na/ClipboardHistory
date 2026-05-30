@@ -36,6 +36,8 @@ swiftc \
     -framework SwiftUI \
     -framework Carbon \
     -framework ApplicationServices \
+    -framework Quartz \
+    -framework ImageIO \
     $SDK_FLAG \
     -target "$TARGET" \
     -O
@@ -44,6 +46,9 @@ echo "✅ 编译完成"
 
 # 复制 Info.plist
 cp "$PROJECT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+
+# 复制应用图标
+cp "$PROJECT_DIR/Assets/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 
 # Ad-hoc 签名（避免 macOS Gatekeeper 警告）
 echo "🔐 签名..."

@@ -13,6 +13,15 @@ class ClipboardStore: ObservableObject {
     /// 历史记录列表（最新在前）
     @Published var items: [ClipboardHistoryItem] = []
 
+    /// 搜索输入；搜索框始终展示，空字符串表示不过滤
+    @Published var searchQuery = ""
+
+    /// 搜索框聚焦请求令牌
+    @Published var searchFocusRequestID = UUID()
+
+    /// 搜索框是否处于输入法组合输入状态
+    var searchHasMarkedText = false
+
     /// 当前选中条目的 ID（用于键盘导航和视觉高亮）
     @Published var selectedItemID: UUID?
 
@@ -30,6 +39,26 @@ class ClipboardStore: ObservableObject {
 
     /// 键盘导航期间鼠标所在条目，等鼠标真正移动后再应用
     var hoverSelectionWhileKeyboardNavigating: UUID?
+
+    /// 当前根据搜索和类型命令过滤后的历史记录
+    var visibleItems: [ClipboardHistoryItem] {
+        let criteria = searchCriteria
+        return items.filter { item in
+            if let type = criteria.type, item.type != type {
+                return false
+            }
+
+            guard let keyword = criteria.keyword else {
+                return true
+            }
+
+            return searchableText(for: item).localizedCaseInsensitiveContains(keyword)
+        }
+    }
+
+    var highlightKeyword: String? {
+        searchCriteria.keyword
+    }
 
     /// 磁盘缓存目录
     private let cacheDir: URL
@@ -109,10 +138,37 @@ class ClipboardStore: ObservableObject {
         }
     }
 
+    // MARK: - 删除记录
+
+    /// 删除当前过滤列表中的选中记录，并清理对应磁盘缓存和缩略图缓存
+    func deleteSelectedVisibleItem() {
+        guard let selectedID = selectedItemID,
+              let visibleIndex = visibleItems.firstIndex(where: { $0.id == selectedID }),
+              let itemIndex = items.firstIndex(where: { $0.id == selectedID }) else {
+            return
+        }
+
+        let removed = items.remove(at: itemIndex)
+        cleanupCacheForItem(removed)
+        imageHashes.removeValue(forKey: removed.id)
+        saveMetadata()
+
+        let remaining = visibleItems
+        if remaining.isEmpty {
+            selectedItemID = nil
+            keyboardScrollItemID = nil
+        } else {
+            let nextIndex = min(visibleIndex, remaining.count - 1)
+            selectFromKeyboard(remaining[nextIndex].id)
+        }
+    }
+
     // MARK: - 清空记录
 
     /// 清空所有历史记录和对应的磁盘缓存
     func clearAll() {
+        cleanupPreviewTempFiles()
+
         for item in items {
             cleanupCacheForItem(item)
         }
@@ -126,13 +182,22 @@ class ClipboardStore: ObservableObject {
         }
 
         items.removeAll()
+        ImageThumbnailProvider.shared.removeAll()
         selectedItemID = nil
         keyboardScrollItemID = nil
         scrollRequestID = UUID()
         isKeyboardNavigating = true
         hoverSelectionWhileKeyboardNavigating = nil
+        searchQuery = ""
+        searchHasMarkedText = false
         imageHashes.removeAll()
         saveMetadata()
+    }
+
+    private func cleanupPreviewTempFiles() {
+        let previewDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClipboardHistoryPreview", isDirectory: true)
+        try? FileManager.default.removeItem(at: previewDir)
     }
 
     // MARK: - 导航状态
@@ -167,10 +232,98 @@ class ClipboardStore: ObservableObject {
     func resetNavigationToTop() {
         isKeyboardNavigating = true
         hoverSelectionWhileKeyboardNavigating = nil
-        selectedItemID = items.first?.id
-        keyboardScrollItemID = items.first?.id
+        selectedItemID = visibleItems.first?.id
+        keyboardScrollItemID = visibleItems.first?.id
         scrollRequestUsesTopAnchor = true
         scrollRequestID = UUID()
+    }
+
+    func prepareForPopupOpen() {
+        searchQuery = ""
+        resetNavigationToTop()
+        focusSearchField()
+    }
+
+    func updateSearchQuery(_ query: String) {
+        searchQuery = query
+        resetNavigationToTop()
+    }
+
+    func appendSearchInput(_ input: String) {
+        updateSearchQuery(searchQuery + input)
+    }
+
+    func deleteLastSearchCharacter() {
+        guard !searchQuery.isEmpty else { return }
+        updateSearchQuery(String(searchQuery.dropLast()))
+    }
+
+    func clearSearch() {
+        guard !searchQuery.isEmpty else { return }
+        updateSearchQuery("")
+    }
+
+    func focusSearchField() {
+        searchFocusRequestID = UUID()
+    }
+
+    func updateSearchMarkedText(_ hasMarkedText: Bool) {
+        searchHasMarkedText = hasMarkedText
+    }
+
+    func releaseTransientMemoryAfterClose() {
+        searchQuery = ""
+        selectedItemID = nil
+        keyboardScrollItemID = nil
+        hoverSelectionWhileKeyboardNavigating = nil
+        isKeyboardNavigating = true
+        scrollRequestUsesTopAnchor = false
+        searchHasMarkedText = false
+    }
+
+    private var searchCriteria: (type: ClipboardItemType?, keyword: String?) {
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return (nil, nil) }
+
+        if trimmed.hasPrefix("/") {
+            let body = String(trimmed.dropFirst())
+            let parts = body.split(maxSplits: 1, whereSeparator: { $0.isWhitespace })
+            guard let command = parts.first else { return (nil, nil) }
+
+            let keyword = parts.count > 1 ? normalizedKeyword(String(parts[1])) : nil
+            return (typeForSearchCommand(String(command)), keyword)
+        }
+
+        return (nil, normalizedKeyword(trimmed))
+    }
+
+    private func typeForSearchCommand(_ command: String) -> ClipboardItemType? {
+        switch command.lowercased() {
+        case "text", "txt", "t", "文本":
+            return .text
+        case "file", "files", "f", "文件":
+            return .file
+        case "image", "img", "photo", "i", "图片", "图像":
+            return .image
+        case "other", "o", "其他":
+            return .other
+        default:
+            return nil
+        }
+    }
+
+    private func normalizedKeyword(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func searchableText(for item: ClipboardHistoryItem) -> String {
+        switch item.type {
+        case .text:
+            return [item.title, item.textPreview].compactMap { $0 }.joined(separator: " ")
+        case .file, .image, .other:
+            return item.title
+        }
     }
 
     // MARK: - 恢复记录到剪切板
@@ -192,9 +345,11 @@ class ClipboardStore: ObservableObject {
             }
 
         case .image:
-            if let cacheURL = item.cacheFileURL,
-               let image = NSImage(contentsOf: cacheURL) {
-                pasteboard.writeObjects([image])
+            autoreleasepool {
+                if let cacheURL = item.cacheFileURL,
+                   let image = NSImage(contentsOf: cacheURL) {
+                    pasteboard.writeObjects([image])
+                }
             }
 
         case .file:
@@ -288,6 +443,7 @@ class ClipboardStore: ObservableObject {
     private func cleanupCacheForItem(_ item: ClipboardHistoryItem) {
         if let cacheURL = item.cacheFileURL {
             try? FileManager.default.removeItem(at: cacheURL)
+            ImageThumbnailProvider.shared.remove(url: cacheURL)
         }
     }
 

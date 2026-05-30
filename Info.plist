@@ -8,6 +8,8 @@
     <string>ClipboardHistory</string>
     <key>CFBundleIdentifier</key>
     <string>com.clipboardhistory.app</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
